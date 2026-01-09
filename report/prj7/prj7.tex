@@ -111,7 +111,7 @@
     
     \item \textbf{实践任务22：在CPU中集成DCache}
     
-    要求将实践任务20完成的Cache模块作为DCache集成到实践任务21完成的CPU中，修改MEMU模块以支持Cache接口，处理好数据访存与Cache的交互，确保Load/Store指令能够正确利用Cache提升性能。完成后在采用AXI总线的SoC验证环境里完成exp22对应func的功能验证，要求成功通过仿真和上板验证。
+    要求将实践任务20完成的Cache模块作为DCache集成到实践任务21完成的CPU中，修改EXEU模块以支持Cache接口，处理好数据访存与Cache的交互，确保Load/Store指令能够正确利用Cache提升性能。完成后在采用AXI总线的SoC验证环境里完成exp22对应func的功能验证，要求成功通过仿真和上板验证。
     
     \item \textbf{实践任务23：在CPU中添加CACOP指令}
     
@@ -119,6 +119,15 @@
 \end{itemize}
 
 \section{设计详细分析}
+
+\subsection{处理器结构设计框图}
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.95\textwidth]{fig/CPU_arch_prj7.png}
+    \caption{处理器结构设计框图}
+    \label{fig:CPU_arch_prj7}
+\end{figure}
 
 \subsection{Cache模块设计（exp20）}
 
@@ -916,7 +925,102 @@ Bridge还需要处理三个端口的仲裁：端口0对应ICache读请求，端�
 
 \subsection{DCache集成到CPU（exp22）}
 
-exp22的任务是将Cache模块作为DCache集成到CPU中。
+exp22的任务是将Cache模块作为DCache集成到CPU中，需要为EXEU添加Cache接口，并添加Uncache处理和写操作的Burst传输。
+
+\subsubsection{EXEU模块的接口修改}
+
+与IFU访问ICache类似，EXEU访问DCache也需要通过VIPT访问方式，除此以外还需要考虑写操作相关信号的生成：
+
+\begin{lstlisting}[language=Verilog]
+assign data_op    = is_store;
+assign data_wstrb =   // st.b
+                      (exe_mem_op == 4'd4) ?
+                      ( addr0 ? 4'b0001 :
+                        addr1 ? 4'b0010 :
+                        addr2 ? 4'b0100 :
+                        addr3 ? 4'b1000 :
+                        4'b0000) :
+                      // st.h
+                      (exe_mem_op == 4'd5) ?
+                      ( (addr0 | addr1) ? 4'b0011 :
+                        (addr2 | addr3) ? 4'b1100 :
+                        4'b0000 ) :
+                      // st.w
+                      (exe_mem_op == 4'd6) ?
+                      ( 4'b1111 ) : 4'b0000;
+assign data_wdata  = // st.b
+                     (exe_mem_op == 4'd4) ?
+                     ( addr0 ? {24'd0, exe_rkd_value[7:0]       } :
+                       addr1 ? {16'd0, exe_rkd_value[7:0],  8'd0} :
+                       addr2 ? { 8'd0, exe_rkd_value[7:0], 16'd0} :
+                       addr3 ? {       exe_rkd_value[7:0], 24'd0} :
+                       32'd0 ) :
+                     // st.h
+                     (exe_mem_op == 4'd5) ?
+                     ( (addr0 | addr1) ? {16'd0, exe_rkd_value[15:0]} :
+                       (addr2 | addr3) ? {exe_rkd_value[15:0], 16'd0} :
+                       32'd0 ) :
+                     // st.w
+                     (exe_mem_op == 4'd6) ?
+                     ( exe_rkd_value ) :
+                     // default
+                     32'd0;
+\end{lstlisting}
+
+对于Uncache操作的判断也与ICache类似：
+
+\begin{lstlisting}[language=Verilog]
+wire [1:0] data_mat = 
+           !csr_crmd_pg_value ? csr_crmd_datm_value : // DA mode: cacheable by default
+           ( is_dmw0 ? csr_dmw0_value[5:4] :     // DMW0 MAT
+             is_dmw1 ? csr_dmw1_value[5:4] :     // DMW1 MAT
+             s1_mat                              // TLB MAT
+             );
+assign data_uncache = (data_mat == 2'b00);  // SUC (MAT=0): uncached
+\end{lstlisting}
+
+\subsubsection{写操作的Burst传输支持}
+
+为提高Cache写操作效率，需要为Bridge模块添加写突发传输支持。在状态机的\texttt{S_AW}状态，需要对AW和W通道进行握手。对于AW通道，只需一次握手；但对于W通道，每次握手时递增\texttt{burst_cnt}，直到突发传输完成。这样，两个通道可以并行传输，且保证了只有当两个通道都完成握手后，才进入后续状态。
+
+\begin{lstlisting}[language=Verilog]
+S_AW: begin
+    if (aw_hs) wready_buf[0] <= 1'b1;
+    if (w_hs) begin
+        if (wlast || burst_finish) begin
+            wready_buf[1] <= 1'b1;
+            burst_cnt <= 3'd0;
+        end else begin
+            burst_cnt <= burst_cnt + 3'd1;
+        end
+    end
+    if (aw_done_next && w_done_next) begin
+        state <= S_B;
+    end
+end
+\end{lstlisting}
+
+对于具体的AXI信号，则需要正确设置\texttt{awlen}和\texttt{wlast}。\texttt{wdata}需要从写数据中取出当前突发传输节拍对应的切片。
+
+\begin{lstlisting}[language=Verilog]
+// AW channel
+assign awid    = {2'b00, grant};
+assign awaddr  = dcache_wr_addr;
+assign awlen   = dcache_awlen;
+assign awsize  = dcache_awsize;
+assign awburst = 2'b01;
+assign awlock  = 2'b00;
+assign awcache = 4'b0000;
+assign awprot  = 3'b000;
+assign awvalid = (state == S_AW) && !aw_done;
+
+// W channel
+assign wid     = {2'b00, grant};
+assign wdata   = dcache_wr_data_slice[burst_cnt];
+assign wstrb   = dcache_wr_wstrb;
+assign wlast   = (state == S_AW) && burst_finish;
+assign wvalid  = (state == S_AW) && !w_done;
+\end{lstlisting}
 
 \subsection{CACOP指令支持（exp23）}
 
@@ -924,7 +1028,9 @@ exp23的任务是在CPU中增加CACOP指令的支持。
 
 \section{实验结果}
 
-exp20和21成功实现了Cache模块的设计，并完成了ICache在CPU中的集成。在Cache模块级验证环境中，Cache模块通过了所有测试用例，验证了Look Up、Hit Write、Replace和Refill等基本操作的正确性。在CPU级验证中，集成了ICache的CPU成功通过了exp21对应的func测试，包括仿真和上板验证，证明了VIPT访问方式、Burst传输、Uncache处理等功能的正确性。
+exp20成功实现了Cache模块的设计。在Cache模块级验证环境中，Cache模块通过了所有测试用例，验证了Look Up、Hit Write、Replace和Refill等基本操作的正确性。
+
+exp21和exp22分别完成了ICache和DCache在CPU中的集成。在CPU级验证中，集成了Cache的CPU成功通过了exp21、exp22对应的func测试，包括仿真和上板验证，证明了VIPT访问方式、Burst传输、Uncache处理等功能的正确性。
 
 \section{小组成员分工}
 
