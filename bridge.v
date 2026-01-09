@@ -1,26 +1,29 @@
 module bridge
   ( output wire        clk,
     output wire        resetn,
-    // inst sram-like interface
-    input wire         inst_sram_req,
-    input wire         inst_sram_wr,
-    input wire [ 1:0]  inst_sram_size,
-    input wire [31:0]  inst_sram_addr,
-    input wire [ 3:0]  inst_sram_wstrb,
-    input wire [31:0]  inst_sram_wdata,
-    output wire        inst_sram_addr_ok,
-    output wire        inst_sram_data_ok,
-    output wire [31:0] inst_sram_rdata,
-    // data sram-like interface
-    input wire         data_sram_req,
-    input wire         data_sram_wr,
-    input wire [ 1:0]  data_sram_size,
-    input wire [31:0]  data_sram_addr,
-    input wire [ 3:0]  data_sram_wstrb,
-    input wire [31:0]  data_sram_wdata,
-    output wire        data_sram_addr_ok,
-    output wire        data_sram_data_ok,
-    output wire [31:0] data_sram_rdata,
+    // ICache interface (Cache-AXI protocol)
+    input wire         icache_rd_req,
+    input wire [ 2:0]  icache_rd_type,
+    input wire [31:0]  icache_rd_addr,
+    output wire        icache_rd_rdy,
+    output wire        icache_ret_valid,
+    output wire        icache_ret_last,
+    output wire [31:0] icache_ret_data,
+    output wire        icache_wr_rdy, // Always 1 for ICache (no write)
+    // DCache interface (Cache-AXI protocol)
+    input wire         dcache_rd_req,
+    input wire [ 2:0]  dcache_rd_type,
+    input wire [31:0]  dcache_rd_addr,
+    output wire        dcache_rd_rdy,
+    output wire        dcache_ret_valid,
+    output wire        dcache_ret_last,
+    output wire [31:0] dcache_ret_data,
+    input wire         dcache_wr_req,
+    input wire [ 2:0]  dcache_wr_type,
+    input wire [31:0]  dcache_wr_addr,
+    input wire [ 3:0]  dcache_wr_wstrb,
+    input wire [127:0] dcache_wr_data,
+    output wire        dcache_wr_rdy,
     // AXI
     input wire         aclk,
     input wire         aresetn,
@@ -70,160 +73,232 @@ module bridge
     assign clk    = aclk;
     assign resetn = aresetn;
 
-`define S_IDLE 5'b00001
-`define S_AR   5'b00010
-`define S_R    5'b00100
-`define S_AW   5'b01000
-`define S_B    5'b10000
+    // State machine states
+    localparam S_IDLE = 5'b00001;
+    localparam S_AR   = 5'b00010;
+    localparam S_R    = 5'b00100;
+    localparam S_AW   = 5'b01000;
+    localparam S_B    = 5'b10000;
 
     reg [4:0] state;
-    reg [1:0] wready_buf; // Track AW and W handshakes
-    reg       grant;      // 0 = inst, 1 = data
-    reg       last_grant; // For round-robin when both request
+    reg [1:0] wready_buf;      // Track AW and W handshakes
+    reg [1:0] grant;           // 0 = icache_rd, 1 = data_rd, 2 = data_wr
+    reg [1:0] last_grant;      // For round-robin arbitration
+    
+    // Burst transfer support
+    reg [2:0] burst_len;       // Number of beats in burst (0-3 for 1-4 beats)
+    reg [2:0] burst_cnt;       // Current beat counter
+    wire      is_burst;
+    wire      burst_finish;
+    
+    assign is_burst = ((grant == 2'd0) && (icache_rd_type == 3'b100)) ||
+                      ((grant == 2'd1) && (dcache_rd_type == 3'b100)) ||
+                      ((grant == 2'd2) && (dcache_wr_type == 3'b100));   // Cache line read
+    assign burst_finish = (burst_cnt == burst_len);
 
-    // Shortcut arrays for the two masters
-    wire        sram_req   [1:0];
-    wire        sram_wr    [1:0];
-    wire [ 1:0] sram_size  [1:0];
-    wire [31:0] sram_addr  [1:0];
-    wire [ 3:0] sram_wstrb [1:0];
-    wire [31:0] sram_wdata [1:0];
-    assign sram_req[0]   = inst_sram_req;
-    assign sram_req[1]   = data_sram_req;
-    assign sram_wr[0]    = inst_sram_wr;
-    assign sram_wr[1]    = data_sram_wr;
-    assign sram_size[0]  = inst_sram_size;
-    assign sram_size[1]  = data_sram_size;
-    assign sram_addr[0]  = inst_sram_addr;
-    assign sram_addr[1]  = data_sram_addr;
-    assign sram_wstrb[0] = inst_sram_wstrb;
-    assign sram_wstrb[1] = data_sram_wstrb;
-    assign sram_wdata[0] = inst_sram_wdata;
-    assign sram_wdata[1] = data_sram_wdata;
+    // Request type decode for ICache
+    wire [7:0] icache_arlen;
+    wire [2:0] icache_arsize;
+    assign icache_arlen  = (icache_rd_type == 3'b100) ? 8'd3   : // Cache line: 4 beats
+                           8'd0;                                 // Single word
+    assign icache_arsize = (icache_rd_type == 3'b100) ? 3'b010 : // 4 bytes per beat
+                           (icache_rd_type == 3'b010) ? 3'b010 : // word
+                           (icache_rd_type == 3'b001) ? 3'b001 : // halfword
+                           3'b000;                               // byte
+    // Request type decode for DCache
+    wire [7:0] dcache_arlen;
+    wire [2:0] dcache_arsize;
+    assign dcache_arlen  = (dcache_rd_type == 3'b100) ? 8'd3   : // Cache line: 4 beats
+                           8'd0;                                 // Single word
+    assign dcache_arsize = (dcache_rd_type == 3'b100) ? 3'b010 : // 4 bytes per beat
+                           (dcache_rd_type == 3'b010) ? 3'b010 : // word
+                           (dcache_rd_type == 3'b001) ? 3'b001 : // halfword
+                           3'b000;                               // byte
+    // Request type decode for DCache
+    wire [7:0] dcache_awlen;
+    wire [2:0] dcache_awsize;
+    assign dcache_awlen  = (dcache_wr_type == 3'b100) ? 8'd3   : // Cache line: 4 beats
+                           8'd0;                                 // Single word
+    assign dcache_awsize = (dcache_wr_type == 3'b100) ? 3'b010 : // 4 bytes per beat
+                           (dcache_wr_type == 3'b010) ? 3'b010 : // word
+                           (dcache_wr_type == 3'b001) ? 3'b001 : // halfword
+                           3'b000;                               // byte
 
-    // Handshake detection
+    wire [31:0] dcache_wr_data_slice [3:0];
+    assign dcache_wr_data_slice[0] = dcache_wr_data[ 31:  0];
+    assign dcache_wr_data_slice[1] = dcache_wr_data[ 63: 32];
+    assign dcache_wr_data_slice[2] = dcache_wr_data[ 95: 64];
+    assign dcache_wr_data_slice[3] = dcache_wr_data[127: 96];
+
+    // Arbitration requests
+    wire icache_rd_req_valid = icache_rd_req;
+    wire data_rd_req_valid   = dcache_rd_req;
+    wire data_wr_req_valid   = dcache_wr_req;
+
+    // Round-robin grant selection to avoid starvation
+    reg [1:0] grant_next;
+    always @(*) begin
+        grant_next = last_grant;
+        case (last_grant)
+            2'd0: begin
+                if (data_rd_req_valid)      grant_next = 2'd1;
+                else if (data_wr_req_valid) grant_next = 2'd2;
+                else if (icache_rd_req_valid) grant_next = 2'd0;
+            end
+            2'd1: begin
+                if (data_wr_req_valid)      grant_next = 2'd2;
+                else if (icache_rd_req_valid) grant_next = 2'd0;
+                else if (data_rd_req_valid) grant_next = 2'd1;
+            end
+            2'd2: begin
+                if (icache_rd_req_valid)    grant_next = 2'd0;
+                else if (data_rd_req_valid) grant_next = 2'd1;
+                else if (data_wr_req_valid) grant_next = 2'd2;
+            end
+            default: begin
+                if (icache_rd_req_valid)    grant_next = 2'd0;
+                else if (data_rd_req_valid) grant_next = 2'd1;
+                else if (data_wr_req_valid) grant_next = 2'd2;
+            end
+        endcase
+    end
+
+    // Handshake signals
     wire ar_hs, aw_hs, w_hs, b_hs, r_hs;
     wire aw_done, w_done;
     wire aw_done_next, w_done_next;
+    
     assign aw_done      = wready_buf[0];
     assign w_done       = wready_buf[1];
-    assign ar_hs        = (state == `S_AR) && sram_req[grant] && arready;
-    assign aw_hs        = (state == `S_AW) && sram_req[grant] && awready && !aw_done;
-    assign w_hs         = (state == `S_AW) && sram_req[grant] && wready  && !w_done;
-    assign b_hs         = (state == `S_B)  && bvalid;
-    assign r_hs         = (state == `S_R)  && rvalid;
-    assign aw_done_next = aw_done | aw_hs;
-    assign w_done_next  = w_done  | w_hs;
+    assign ar_hs        = (state == S_AR) && arvalid && arready;
+    assign aw_hs        = (state == S_AW) && awvalid && awready;
+    assign w_hs         = (state == S_AW) && wvalid && wready;
+    assign b_hs         = (state == S_B) && bvalid && bready;
+    assign r_hs         = (state == S_R) && rvalid && rready;
+    assign aw_done_next = aw_done || aw_hs;
+    assign w_done_next  = w_done  || (w_hs && (wlast || burst_finish));
 
-    // Master-visible handshakes
-    wire        sram_addr_ok;
-    wire        sram_data_ok;
-    wire [31:0] sram_rdata;
-    assign inst_sram_addr_ok = (grant == 1'b0) && sram_addr_ok;
-    assign data_sram_addr_ok = (grant == 1'b1) && sram_addr_ok;
-    assign inst_sram_data_ok = (grant == 1'b0) && sram_data_ok;
-    assign data_sram_data_ok = (grant == 1'b1) && sram_data_ok;
-    assign inst_sram_rdata   = sram_rdata;
-    assign data_sram_rdata   = sram_rdata;
-
+    // State machine
     always @(posedge aclk) begin
         if (!aresetn) begin
-            state      <= `S_IDLE;
+            state      <= S_IDLE;
             wready_buf <= 2'b00;
-            grant      <= 1'b0;
-            last_grant <= 1'b1; // so first tie-break favors inst (0)
+            grant      <= 2'd0;
+            last_grant <= 2'd2;
+            burst_len  <= 3'd0;
+            burst_cnt  <= 3'd0;
         end else begin
-            case (1'b1)
-              state[0]: begin
-                  // Idle: pick next request with simple round-robin to avoid starvation
-                  // wready_buf <= 2'b00;
-                  if (sram_req[0] && sram_req[1]) begin
-                      // Both asserted: alternate
-                      grant <= ~last_grant;
-                      state <= sram_wr[~last_grant] ? `S_AW : `S_AR;
-                  end else if (sram_req[0]) begin
-                      grant <= 1'b0;
-                      state <= sram_wr[0] ? `S_AW : `S_AR;
-                  end else if (sram_req[1]) begin
-                      grant <= 1'b1;
-                      state <= sram_wr[1] ? `S_AW : `S_AR;
-                  end
-              end
-              state[1]: begin
-                  // AR
-                  if (!sram_req[grant]) begin
-                      state <= `S_IDLE;          // cancelled before addr_ok
-                  end else if (ar_hs) begin
-                      state <= `S_R;
-                  end
-              end
-              state[2]: begin
-                  // R
-                  if (r_hs) state <= `S_IDLE;
-              end
-              state[3]: begin
-                  // AW/W
-                  if (!sram_req[grant]) begin
-                      wready_buf <= 2'b00;
-                      state <= `S_IDLE;          // cancelled before addr_ok
-                  end else begin
-                      if (aw_hs) wready_buf[0] <= 1'b1;
-                      if (w_hs)  wready_buf[1] <= 1'b1;
-                      if (aw_done_next && w_done_next) begin
-                          state <= `S_B;
-                      end
-                  end
-              end
-              state[4]: begin
-                  // B
-                  wready_buf <= 2'b00;
-                  if (b_hs) state <= `S_IDLE;
-              end
-            endcase
+            case (state)
+                S_IDLE: begin
+                    wready_buf <= 2'b00;
+                    burst_cnt  <= 3'd0;
+                    
+                    if (icache_rd_req_valid || data_rd_req_valid || data_wr_req_valid) begin
+                        grant <= grant_next;
+                        last_grant <= grant_next;
+                        if (grant_next == 2'd2) begin
+                            state <= S_AW;
+                            burst_len <= (dcache_wr_type == 3'b100) ? 3'd3 : 3'd0;
+                        end else begin
+                            state <= S_AR;
+                            burst_len <= (grant_next == 2'd0) ?
+                                         ((icache_rd_type == 3'b100) ? 3'd3 : 3'd0) :
+                                         ((dcache_rd_type == 3'b100) ? 3'd3 : 3'd0);
+                        end
+                    end
+                end
 
-            // Remember last granted master when a request is accepted
-            if (sram_addr_ok)
-                last_grant <= grant;
+                S_AR: begin
+                    if (ar_hs) begin
+                        state <= S_R;
+                    end
+                end
+
+                S_R: begin
+                    if (r_hs) begin
+                        if (rlast || burst_finish) begin
+                            state <= S_IDLE;
+                            burst_cnt <= 3'd0;
+                        end else begin
+                            burst_cnt <= burst_cnt + 3'd1;
+                        end
+                    end
+                end
+
+                S_AW: begin
+                    if (aw_hs) wready_buf[0] <= 1'b1;
+                    if (w_hs) begin
+                        if (wlast || burst_finish) begin
+                            wready_buf[1] <= 1'b1;
+                            burst_cnt <= 3'd0;
+                        end else begin
+                            burst_cnt <= burst_cnt + 3'd1;
+                        end
+                    end
+                    if (aw_done_next && w_done_next) begin
+                        state <= S_B;
+                    end
+                end
+
+                S_B: begin
+                    wready_buf <= 2'b00;
+                    if (b_hs) begin
+                        state <= S_IDLE;
+                    end
+                end
+
+                default: state <= S_IDLE;
+            endcase
         end
     end
 
-    assign sram_addr_ok = ar_hs | (aw_done_next & w_done_next);
-    assign sram_data_ok = r_hs | b_hs;
-    assign sram_rdata   = rdata;
+    // ICache interface outputs
+    assign icache_rd_rdy    = (state == S_AR) && (grant == 2'd0) && arready;
+    assign icache_ret_valid = (state == S_R)  && (grant == 2'd0) && rvalid;
+    assign icache_ret_last  = (state == S_R)  && (grant == 2'd0) && rvalid && burst_finish;
+    assign icache_ret_data  = rdata;
+    assign icache_wr_rdy    = 1'b1; // ICache never writes
+
+    // DCache interface outputs
+    assign dcache_rd_rdy    = (state == S_AR) && (grant == 2'd1) && arready;
+    assign dcache_ret_valid = (state == S_R)  && (grant == 2'd1) && rvalid;
+    assign dcache_ret_last  = (state == S_R)  && (grant == 2'd1) && rvalid && burst_finish;
+    assign dcache_ret_data  = rdata;
+    assign dcache_wr_rdy    = (state == S_AW) && (grant == 2'd2) && (aw_done_next && w_done_next);
 
     // AR channel
-    assign arid    = {3'b000, grant};
-    assign araddr  = sram_addr[grant];
-    assign arlen   = 8'b0;
-    assign arsize  = {1'b0, sram_size[grant]}; // map 1/2/4-byte to AXI size
-    assign arburst = 2'b01;
+    assign arid    = {2'b00, grant};
+    assign araddr  = (grant == 2'd0) ? icache_rd_addr : (grant == 2'd1) ? dcache_rd_addr : dcache_wr_addr;
+    assign arlen   = (grant == 2'd0) ? icache_arlen : dcache_arlen;
+    assign arsize  = (grant == 2'd0) ? icache_arsize : dcache_arsize;
+    assign arburst = 2'b01; // INCR
     assign arlock  = 2'b00;
     assign arcache = 4'b0000;
     assign arprot  = 3'b000;
-    assign arvalid = (state == `S_AR) && sram_req[grant];
+    assign arvalid = (state == S_AR);
 
     // R channel
-    assign rready  = (state == `S_R);
+    assign rready  = (state == S_R);
 
     // AW channel
-    assign awid    = {3'b000, grant};
-    assign awaddr  = sram_addr[grant];
-    assign awlen   = 8'b0;
-    assign awsize  = {1'b0, sram_size[grant]};
+    assign awid    = {2'b00, grant};
+    assign awaddr  = dcache_wr_addr;
+    assign awlen   = dcache_awlen;
+    assign awsize  = dcache_awsize;
     assign awburst = 2'b01;
     assign awlock  = 2'b00;
     assign awcache = 4'b0000;
     assign awprot  = 3'b000;
-    assign awvalid = (state == `S_AW) && !aw_done && sram_req[grant];
+    assign awvalid = (state == S_AW) && !aw_done;
 
     // W channel
-    assign wid     = {3'b000, grant};
-    assign wdata   = sram_wdata[grant];
-    assign wstrb   = sram_wstrb[grant];
-    assign wlast   = 1'b1;
-    assign wvalid  = (state == `S_AW) && !w_done && sram_req[grant];
+    assign wid     = {2'b00, grant};
+    assign wdata   = dcache_wr_data_slice[burst_cnt];
+    assign wstrb   = dcache_wr_wstrb;
+    assign wlast   = (state == S_AW) && burst_finish;
+    assign wvalid  = (state == S_AW) && !w_done;
 
     // B channel
-    assign bready  = (state == `S_B);
+    assign bready  = (state == S_B);
     
 endmodule

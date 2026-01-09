@@ -162,6 +162,41 @@ module IDU(
 
     // Instruction decode logic
     
+    // TLB related instructions (direct bit-pattern match)
+    wire inst_tlbsrch = (inst[31:10] == 22'b0000011001001000001010) && (inst[9:0]  == 10'b0);
+    wire inst_tlbrd   = (inst[31:10] == 22'b0000011001001000001011) && (inst[9:0]  == 10'b0);
+    wire inst_tlbwr   = (inst[31:10] == 22'b0000011001001000001100) && (inst[9:0]  == 10'b0);
+    wire inst_tlbfill = (inst[31:10] == 22'b0000011001001000001101) && (inst[9:0]  == 10'b0);
+    wire inst_invtlb  = (inst[31:15] == 17'b00000110010010011);
+    wire [2:0] id_tlb_op = inst_tlbsrch ? `TLB_OP_SRCH :
+                           inst_tlbrd   ? `TLB_OP_RD   :
+                           inst_tlbwr   ? `TLB_OP_WR   :
+                           inst_tlbfill ? `TLB_OP_FILL :
+                           inst_invtlb  ? `TLB_OP_INV  : `TLB_OP_NONE;
+    wire [4:0] id_invtlb_op = inst[4:0];
+    wire       invtlb_illegal = inst_invtlb & (inst[4:0] > 5'd6);
+
+    // CACOP instructions (cache operations)
+    // Format: cacop code, rj, si12
+    // Bits 31-22: 0x0000011000, Bits 4-0: code[4:0]
+    wire inst_cacop = (inst[31:22] == 10'b0000011000);
+
+    // CACOP control signals
+    wire [4:0] id_cacop_code = inst[4:0];  // code[4:0]
+    wire id_cacop_is_icache = (id_cacop_code[2:0] == 3'b000);  // code[2:0]=0: I-Cache
+    wire id_cacop_is_dcache = (id_cacop_code[2:0] == 3'b001);  // code[2:0]=1: D-Cache
+    wire id_cacop_op_init   = (id_cacop_code[4:3] == 2'b00);   // Store Tag (initialize)
+    wire id_cacop_op_idxinv = (id_cacop_code[4:3] == 2'b01);   // Index Invalidate
+    wire id_cacop_op_qry    = (id_cacop_code[4:3] == 2'b10);   // Query Index
+    wire id_cacop_op_impl   = (id_cacop_code[4:3] == 2'b11);   // Implementation-defined (NOP)
+
+    // Illegal CACOP codes
+    // wire id_cacop_illegal_icache = inst_cacop & id_cacop_is_icache & id_cacop_op_qry;  // Query Index now supported
+    // wire id_cacop_illegal_dcache = inst_cacop & id_cacop_is_dcache & id_cacop_op_qry;  // Query Index now supported
+    wire id_cacop_illegal_l2     = (id_cacop_code[2:0] == 3'b010);  // L2 Cache not implemented
+    wire id_ex_cacop_illegal = (/*id_cacop_illegal_icache | id_cacop_illegal_dcache |*/
+                               id_cacop_illegal_l2) & id_valid;
+
     // Instruction types:
     // R: Reg-Reg Arithmetic
     //   add.w sub.w slt sltu nor and or xor sll.w srl.w sra.w
@@ -236,7 +271,7 @@ module IDU(
     wire inst_bgeu = ty_B & op_31_26_d[27];
 
     // ALU operation encoding (extended to 18 bits for multiply/divide)
-    assign alu_op[0]  = inst_add_w | inst_addi_w | ty_M |
+    assign alu_op[0]  = inst_add_w | inst_addi_w | ty_M | inst_cacop |
                         inst_jirl  | inst_bl     | inst_pcaddu12i;
     assign alu_op[1]  = inst_sub_w | inst_bne    | inst_beq;
     assign alu_op[2]  = inst_slt   | inst_slti   | inst_blt    | inst_bge;
@@ -282,26 +317,65 @@ module IDU(
                       inst_ld_bu  | inst_ld_hu  | inst_st_b   | inst_st_h   | inst_st_w   | inst_lu12i_w|
                       inst_pcaddu12i | inst_jirl | inst_b | inst_bl | inst_beq | inst_bne | inst_blt |
                       inst_bge    | inst_bltu   | inst_bgeu   | inst_syscall| inst_break  | inst_ertn   |
-                      inst_csrrd  | inst_csrwr  | inst_csrxchg | inst_rdcntid | inst_rdcntvl | inst_rdcntvh;
+                      inst_csrrd  | inst_csrwr  | inst_csrxchg | inst_rdcntid | inst_rdcntvl | inst_rdcntvh |
+                      inst_tlbsrch | inst_tlbrd | inst_tlbwr | inst_tlbfill | inst_invtlb | inst_cacop;
 
-    // Exception and interrupt generation  
+    // Exception and interrupt generation
     wire id_ex_int     = has_int & id_valid;     // Interrupt exception
     wire id_ex_syscall = inst_syscall;          // System call exception
     wire id_ex_break   = inst_break;            // Break point exception
-    wire id_ex_ine     = ~inst_known & id_valid; // Instruction not exist exception
+    wire id_ex_ine     = (~inst_known | invtlb_illegal | (inst_cacop & id_ex_cacop_illegal)) & id_valid; // Instruction not exist exception
     
-    wire        id_ex_valid   = if_ex_valid | id_ex_int | id_ex_syscall | id_ex_break | id_ex_ine;
-    wire [5:0]  id_ecode      = if_ex_valid ? if_ecode :
-                                id_ex_int   ? `ECODE_INT :
-                                id_ex_syscall ? `ECODE_SYS :
-                                id_ex_break ? `ECODE_BRK :
-                                id_ex_ine   ? `ECODE_INE : 6'd0;
+    wire csr_tlb       =
+         (id_csr_num == `CSR_ASID)    || (id_csr_num == `CSR_CRMD)    ||
+         (id_csr_num == `CSR_DMW0)    || (id_csr_num == `CSR_DMW1)    ||
+         (id_csr_num == `CSR_TLBIDX)  || (id_csr_num == `CSR_TLBEHI)  ||
+         (id_csr_num == `CSR_TLBELO0) || (id_csr_num == `CSR_TLBELO1);
+    wire id_ex_refresh =
+         inst_tlbrd || inst_tlbwr || inst_tlbsrch || inst_tlbfill || inst_invtlb ||
+         (inst_csrwr   && csr_tlb) ||
+         (inst_csrxchg && csr_tlb) ||
+         (inst_cacop && id_cacop_is_icache);  // ICache CACOP requires pipeline flush
+    // Mark refresh on the first following instruction
+    reg  handshake_done;
+    always @(posedge clk) begin
+        if (if_to_id_valid && id_allowin) begin
+            handshake_done <= 1;
+        end else begin
+            handshake_done <= 0;
+        end
+    end
+    reg  need_refresh;
+    always @(posedge clk) begin
+        if (!resetn) begin
+            need_refresh <= 0;
+        end else begin
+            if (flush) begin
+                need_refresh <= 0;
+            end else if (handshake_done) begin
+                if (need_refresh) begin
+                    need_refresh <= 0;
+                end else if (id_ex_refresh) begin
+                    need_refresh <= 1;
+                end
+            end
+        end
+    end
+    
+    wire        id_ex_valid   = if_ex_valid | id_ex_int | id_ex_syscall | id_ex_break | id_ex_ine | need_refresh;
+    wire [5:0]  id_ecode      = if_ex_valid   ? if_ecode    :
+                                id_ex_int     ? `ECODE_INT  :
+                                id_ex_syscall ? `ECODE_SYS  :
+                                id_ex_break   ? `ECODE_BRK  :
+                                id_ex_ine     ? `ECODE_INE  :
+                                need_refresh  ? `ECODE_REFR :
+                                6'd0;
     wire [8:0]  id_esubcode   = if_ex_valid ? if_esubcode : `ESUBCODE_NONE;
     wire        id_is_ertn    = if_is_ertn | inst_ertn;
 
     // Immediate type selection
     assign need_ui5  = ty_S;
-    assign need_si12 = (ty_I & ~inst_andi & ~inst_ori & ~inst_xori) | ty_M;
+    assign need_si12 = (ty_I & ~inst_andi & ~inst_ori & ~inst_xori) | ty_M | inst_cacop;
     assign need_ui12 = inst_andi | inst_ori | inst_xori;
     assign need_si16 = ty_B & ~(inst_b | inst_bl);
     assign need_si20 = ty_U;
@@ -323,12 +397,14 @@ module IDU(
     // Control signal generation
     assign src_reg_is_rd = ty_B_COND | ty_M_ST | inst_csrwr | inst_csrxchg;
     assign src1_is_pc = inst_jirl | inst_bl | inst_pcaddu12i;
-    assign src2_is_imm = ty_S | ty_I | ty_M | ty_U | inst_jirl | inst_bl;
+    assign src2_is_imm = ty_S | ty_I | ty_M | ty_U | inst_jirl | inst_bl | inst_cacop;
 
     assign res_from_mem = ty_M_LD;
     assign dst_is_r1 = inst_bl;
     assign dst_is_rj = inst_rdcntid;
-    assign gr_we = ~(ty_M_ST | ty_B_COND | inst_b | inst_syscall | inst_break | inst_ertn) & id_valid & ~id_ex_valid;
+    assign gr_we = ~(ty_M_ST | ty_B_COND | inst_b | inst_syscall | inst_break | inst_ertn |
+                     inst_tlbsrch | inst_tlbrd | inst_tlbwr | inst_tlbfill | inst_invtlb | inst_cacop)
+                   & id_valid & ~id_ex_valid;
     assign mem_op = {4{ty_M}} & op_25_22;
     assign dest = dst_is_r1 ? 5'd1 :
                   dst_is_rj ?   rj : rd;
@@ -365,8 +441,8 @@ module IDU(
     assign conflict_r2_mem  = (|rf_raddr2) & (rf_raddr2 == mem_rf_waddr) & mem_rf_we;
     assign conflict_r1_exe  = (|rf_raddr1) & (rf_raddr1 == exe_rf_waddr) & exe_rf_we;
     assign conflict_r2_exe  = (|rf_raddr2) & (rf_raddr2 == exe_rf_waddr) & exe_rf_we;
-    assign need_r1          = ~src1_is_pc & (|alu_op);
-    assign need_r2          = ~src2_is_imm & ((|alu_op[11:0]) | ty_MD);
+    assign need_r1          = (~src1_is_pc & (|alu_op)) | inst_invtlb | inst_cacop;
+    assign need_r2          = (~src2_is_imm & ((|alu_op[11:0]) | ty_MD)) | inst_invtlb;
     assign rj_value  =  conflict_r1_exe ? exe_rf_wdata:
                         conflict_r1_mem ? mem_rf_wdata:
                         conflict_r1_wb  ? wb_rf_wdata : rf_rdata1;
@@ -375,6 +451,7 @@ module IDU(
                         conflict_r2_wb  ? wb_rf_wdata : rf_rdata2;
 
     // CSR decode signals
+    // Note: TLBSRCH updates CSR in EX stage, not in ID stage
     wire id_csr_read      = inst_csrrd | inst_csrwr | inst_csrxchg | inst_rdcntid;
     wire id_csr_we        = inst_csrwr | inst_csrxchg;
     wire [31:0] id_csr_wmask     = id_csr_we ? (inst_csrxchg ? rj_value : 32'hffff_ffff) : 32'd0;
@@ -402,10 +479,17 @@ module IDU(
             id_csr_wmask,  // 32
             id_csr_wvalue, // 32
 
+            inst_cacop,      // 1
+            id_cacop_code,   // 5
+            id_cacop_is_icache,  // 1
+            id_cacop_is_dcache,  // 1
+
             id_ex_valid,  // 1
             id_ecode,  // 6
             id_esubcode,  //  9
-            id_is_ertn  // 1
+            id_is_ertn,  // 1
+            id_tlb_op,    // 3
+            id_invtlb_op  // 5
     };
 
 endmodule

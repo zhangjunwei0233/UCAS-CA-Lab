@@ -24,34 +24,94 @@ module CSR
    input wire [31:0]  wb_pc,
    input wire [31:0]  wb_vaddr,
    input wire [5:0]   wb_ecode,
-   input wire [8:0]   wb_esubcode
+   input wire [8:0]   wb_esubcode,
+
+   // TLB read trigger (TLBRD)
+   input wire         tlbrd_en,
+   input wire         tlb_r_e,
+   input wire [18:0]  tlb_r_vppn,
+   input wire [5:0]   tlb_r_ps,
+   input wire [9:0]   tlb_r_asid,
+   input wire         tlb_r_g,
+   input wire [19:0]  tlb_r_ppn0,
+   input wire [1:0]   tlb_r_plv0,
+   input wire [1:0]   tlb_r_mat0,
+   input wire         tlb_r_d0,
+   input wire         tlb_r_v0,
+   input wire [19:0]  tlb_r_ppn1,
+   input wire [1:0]   tlb_r_plv1,
+   input wire [1:0]   tlb_r_mat1,
+   input wire         tlb_r_d1,
+   input wire         tlb_r_v1,
+
+   // TLB related CSR values for pipeline
+   output wire [3:0]  tlbidx_index,
+   output wire [5:0]  tlbidx_ps,
+   output wire        tlbidx_ne,
+   output wire [18:0] tlbehi_vppn,
+   output wire [31:0] csr_tlbidx_value,
+   output wire [31:0] csr_tlbehi_value,
+   output wire [31:0] csr_tlbelo0_value,
+   output wire [31:0] csr_tlbelo1_value,
+   output wire [31:0] csr_asid_value,
+   output wire [31:0] csr_tlbren_value,
+   output wire        csr_crmd_da_value,
+   output wire        csr_crmd_pg_value,
+   output wire [1:0]  csr_crmd_plv_value,
+   output wire [1:0]  csr_crmd_datf_value,
+   output wire [1:0]  csr_crmd_datm_value,
+   output wire [31:0] csr_dmw0_value,
+   output wire [31:0] csr_dmw1_value
    );
+
+    wire wb_ex_tlb_err =
+         wb_ecode == `ECODE_PIL || wb_ecode == `ECODE_PIS || wb_ecode == `ECODE_PIF ||
+         wb_ecode == `ECODE_PME || wb_ecode == `ECODE_PPI || wb_ecode == `ECODE_TLBR;
 
     // CRMD
     reg [1:0] csr_crmd_plv;
     reg       csr_crmd_ie;
+    reg       csr_crmd_da;
+    reg       csr_crmd_pg;
+    reg [1:0] csr_crmd_datf;
+    reg [1:0] csr_crmd_datm;
     always @(posedge clk) begin
         if (~resetn) begin
             csr_crmd_plv <= 2'b0;
             csr_crmd_ie  <= 1'b0;
-        end else if (wb_ex) begin
+            csr_crmd_da  <= 1'b1;
+            csr_crmd_pg  <= 1'b0;
+            csr_crmd_datf <= 2'b0;
+            csr_crmd_datm <= 2'b0;
+        end else if (wb_ex && (wb_ecode != `ECODE_REFR)) begin
             csr_crmd_plv <= 2'b0;
             csr_crmd_ie  <= 1'b0;
+            if (wb_ecode == `ECODE_TLBR) begin
+                csr_crmd_da <= 1'b1;
+                csr_crmd_pg <= 1'b0;
+            end
         end else if (ertn_flush) begin
             csr_crmd_plv <= csr_prmd_pplv;
             csr_crmd_ie  <= csr_prmd_pie;
+            if (csr_estat_ecode == `ECODE_TLBR) begin
+                csr_crmd_da <= 1'b0;
+                csr_crmd_pg <= 1'b1;
+            end
         end else if (csr_we && csr_num == `CSR_CRMD) begin
-            csr_crmd_plv <= ( csr_wmask[`CSR_CRMD_PLV] & csr_wvalue[`CSR_CRMD_PLV]) |
-                            (~csr_wmask[`CSR_CRMD_PLV] & csr_crmd_plv);
-            csr_crmd_ie  <= ( csr_wmask[`CSR_CRMD_IE]  & csr_wvalue[`CSR_CRMD_IE] ) |
-                            (~csr_wmask[`CSR_CRMD_IE]  & csr_crmd_ie );
+            csr_crmd_plv  <= ( csr_wmask[`CSR_CRMD_PLV]  & csr_wvalue[`CSR_CRMD_PLV])  |
+                             (~csr_wmask[`CSR_CRMD_PLV]  & csr_crmd_plv);
+            csr_crmd_ie   <= ( csr_wmask[`CSR_CRMD_IE]   & csr_wvalue[`CSR_CRMD_IE])   |
+                             (~csr_wmask[`CSR_CRMD_IE]   & csr_crmd_ie );
+            csr_crmd_da   <= ( csr_wmask[`CSR_CRMD_DA]   & csr_wvalue[`CSR_CRMD_DA])   |
+                             (~csr_wmask[`CSR_CRMD_DA]   & csr_crmd_da);
+            csr_crmd_pg   <= ( csr_wmask[`CSR_CRMD_PG]   & csr_wvalue[`CSR_CRMD_PG])   |
+                             (~csr_wmask[`CSR_CRMD_PG]   & csr_crmd_pg);
+            csr_crmd_datf <= ( csr_wmask[`CSR_CRMD_DATF] & csr_wvalue[`CSR_CRMD_DATF]) |
+                             (~csr_wmask[`CSR_CRMD_DATF] & csr_crmd_datf);
+            csr_crmd_datm <= ( csr_wmask[`CSR_CRMD_DATM] & csr_wvalue[`CSR_CRMD_DATM]) |
+                             (~csr_wmask[`CSR_CRMD_DATM] & csr_crmd_datm);
         end
     end
-
-    wire       csr_crmd_da   = 1'b1;
-    wire       csr_crmd_pg   = 1'b0;
-    wire [1:0] csr_crmd_datf = 2'b0;
-    wire [1:0] csr_crmd_datm = 2'b0;
 
     wire [31:0] csr_crmd =
                 // 31:9           8:7            6:5            4            3            2           1:0
@@ -61,7 +121,7 @@ module CSR
     reg [1:0] csr_prmd_pplv;
     reg       csr_prmd_pie;
     always @(posedge clk) begin
-        if (wb_ex) begin
+        if (wb_ex && (wb_ecode != `ECODE_REFR)) begin
             csr_prmd_pplv <= csr_crmd_plv;
             csr_prmd_pie  <= csr_crmd_ie;
         end else if (csr_we && csr_num == `CSR_PRMD) begin
@@ -113,7 +173,7 @@ module CSR
         end
         csr_estat_is[12] <= ipi_int_in;
 
-        if (wb_ex) begin
+        if (wb_ex && (wb_ecode != `ECODE_REFR)) begin
             csr_estat_ecode    <= wb_ecode;
             csr_estat_esubcode <= wb_esubcode;
         end
@@ -126,7 +186,7 @@ module CSR
     // ERA
     reg [31:0] csr_era_pc;
     always @(posedge clk) begin
-        if (wb_ex) begin
+        if (wb_ex && (wb_ecode != `ECODE_REFR)) begin
             csr_era_pc <= wb_pc;
         end else if (csr_we && csr_num == `CSR_ERA) begin
             csr_era_pc <= ( csr_wmask[`CSR_ERA_PC] & csr_wvalue[`CSR_ERA_PC]) |
@@ -147,12 +207,99 @@ module CSR
 
     wire [31:0] csr_eentry = {csr_eentry_va, 6'd0};
 
+    // TLBIDX
+    reg [3:0] csr_tlbidx_index;
+    reg [5:0] csr_tlbidx_ps;
+    reg       csr_tlbidx_ne;
+    wire [31:0] csr_tlbidx = {csr_tlbidx_ne, 1'b0, csr_tlbidx_ps, 8'd0, 12'd0, csr_tlbidx_index};
+    always @(posedge clk) begin
+        if (~resetn) begin
+            csr_tlbidx_index <= 4'd0;
+            csr_tlbidx_ps    <= 6'd0;
+            csr_tlbidx_ne    <= 1'b1;
+        end else if (tlbrd_en) begin
+            csr_tlbidx_ps    <= tlb_r_e ? tlb_r_ps : 6'd0;
+            csr_tlbidx_ne    <= ~tlb_r_e;
+        end else if (csr_we && csr_num == `CSR_TLBIDX) begin
+            csr_tlbidx_index <= ( csr_wmask[`CSR_TLBIDX_INDEX] & csr_wvalue[`CSR_TLBIDX_INDEX]) |
+                                (~csr_wmask[`CSR_TLBIDX_INDEX] & csr_tlbidx_index);
+            csr_tlbidx_ps    <= ( csr_wmask[`CSR_TLBIDX_PS]    & csr_wvalue[`CSR_TLBIDX_PS])    |
+                                (~csr_wmask[`CSR_TLBIDX_PS]    & csr_tlbidx_ps);
+            csr_tlbidx_ne    <= ( csr_wmask[`CSR_TLBIDX_NE]    & csr_wvalue[`CSR_TLBIDX_NE])    |
+                                (~csr_wmask[`CSR_TLBIDX_NE]    & csr_tlbidx_ne);
+        end
+    end
+
+    // TLBEHI
+    reg [18:0] csr_tlbehi_vppn;
+    wire [31:0] csr_tlbehi = {csr_tlbehi_vppn, 13'd0};
+    always @(posedge clk) begin
+        if (~resetn) begin
+            csr_tlbehi_vppn <= 19'd0;
+        end else if (tlbrd_en) begin
+            csr_tlbehi_vppn <= tlb_r_e ? tlb_r_vppn : 19'd0;
+        end else if (csr_we && csr_num == `CSR_TLBEHI) begin
+            csr_tlbehi_vppn <= ( csr_wmask[`CSR_TLBEHI_VPPN] & csr_wvalue[`CSR_TLBEHI_VPPN]) |
+                                (~csr_wmask[`CSR_TLBEHI_VPPN] & csr_tlbehi_vppn);
+        end else if (wb_ex && wb_ex_tlb_err) begin
+            csr_tlbehi_vppn <= wb_vaddr[31:13];
+        end
+    end
+
+    // TLBELO0 / TLBELO1
+    reg [31:0] csr_tlbelo0;
+    reg [31:0] csr_tlbelo1;
+    always @(posedge clk) begin
+        if (~resetn) begin
+            csr_tlbelo0 <= 32'd0;
+            csr_tlbelo1 <= 32'd0;
+        end else if (tlbrd_en) begin
+            csr_tlbelo0 <= tlb_r_e ? {4'd0, tlb_r_ppn0, 1'b0, tlb_r_g, tlb_r_mat0, tlb_r_plv0, tlb_r_d0, tlb_r_v0}
+                                      : 32'd0;
+            csr_tlbelo1 <= tlb_r_e ? {4'd0, tlb_r_ppn1, 1'b0, tlb_r_g, tlb_r_mat1, tlb_r_plv1, tlb_r_d1, tlb_r_v1}
+                                      : 32'd0;
+        end else if (csr_we && csr_num == `CSR_TLBELO0) begin
+            csr_tlbelo0 <= ( csr_wmask & csr_wvalue) | (~csr_wmask & csr_tlbelo0);
+        end else if (csr_we && csr_num == `CSR_TLBELO1) begin
+            csr_tlbelo1 <= ( csr_wmask & csr_wvalue) | (~csr_wmask & csr_tlbelo1);
+        end
+    end
+
+    // ASID
+    reg [9:0] csr_asid_asid;
+    wire [7:0] csr_asidbits = 8'd10;
+    wire [31:0] csr_asid = {8'd0, csr_asidbits, 6'd0, csr_asid_asid};
+    always @(posedge clk) begin
+        if (~resetn) begin
+            csr_asid_asid <= 10'd0;
+        end else if (tlbrd_en) begin
+            csr_asid_asid <= tlb_r_e ? tlb_r_asid : 10'd0;
+        end else if (csr_we && csr_num == `CSR_ASID) begin
+            csr_asid_asid <= ( csr_wmask[`CSR_ASID_ASID] & csr_wvalue[`CSR_ASID_ASID]) |
+                             (~csr_wmask[`CSR_ASID_ASID] & csr_asid_asid);
+        end
+    end
+
+    // TLBRENTRY
+    reg [25:0] csr_tlbren_pa;
+    always @(posedge clk) begin
+        if (~resetn) begin
+            csr_tlbren_pa <= 26'd0;
+        end else if (csr_we && csr_num == `CSR_TLBRENTRY) begin
+            csr_tlbren_pa <= ( csr_wmask[`CSR_TLBRENTRY_PA] & csr_wvalue[`CSR_TLBRENTRY_PA]) |
+                             (~csr_wmask[`CSR_TLBRENTRY_PA] & csr_tlbren_pa);
+        end
+    end
+    wire [31:0] csr_tlbren = {csr_tlbren_pa, 6'd0};
+
     // BADV
     reg [31:0] csr_badv_vaddr;
     wire wb_ex_addr_err = wb_ecode == `ECODE_ADE || wb_ecode == `ECODE_ALE;
     always @(posedge clk) begin
         if (wb_ex && wb_ex_addr_err) begin
-            csr_badv_vaddr <= (wb_ecode == `ECODE_ADE && wb_esubcode == `ESUBCODE_ADEF) ? wb_pc : wb_vaddr;
+            csr_badv_vaddr <= (wb_ecode == `ECODE_ADE && wb_esubcode == 0) ? wb_pc : wb_vaddr;
+        end else if (wb_ex && wb_ex_tlb_err) begin
+            csr_badv_vaddr <= wb_vaddr;
         end
     end
 
@@ -244,25 +391,115 @@ module CSR
     wire csr_ticlr_clr = 1'b0;
     wire [31:0] csr_ticlr = {31'd0, csr_ticlr_clr};
 
+    // DMW0, DMW1
+    reg [2:0]   csr_dmw0_vseg;
+    reg [2:0]   csr_dmw0_pseg;
+    reg [1:0]   csr_dmw0_mat;
+    reg         csr_dmw0_plv3;
+    reg         csr_dmw0_plv0;
+    always @(posedge clk) begin
+        if (~resetn) begin
+            csr_dmw0_vseg <= 3'd0;
+            csr_dmw0_pseg <= 3'd0;
+            csr_dmw0_mat  <= 2'd0;
+            csr_dmw0_plv3 <= 1'd0;
+            csr_dmw0_plv0 <= 1'd0;
+        end else begin
+            if (csr_we && csr_num == `CSR_DMW0) begin
+                csr_dmw0_vseg <= ( csr_wmask[`CSR_DMW_VSEG] & csr_wvalue[`CSR_DMW_VSEG]) |
+                                 (~csr_wmask[`CSR_DMW_VSEG] & csr_dmw0_vseg);
+                csr_dmw0_pseg <= ( csr_wmask[`CSR_DMW_PSEG] & csr_wvalue[`CSR_DMW_PSEG]) |
+                                 (~csr_wmask[`CSR_DMW_PSEG] & csr_dmw0_pseg);
+                csr_dmw0_mat  <= ( csr_wmask[`CSR_DMW_MAT]  & csr_wvalue[`CSR_DMW_MAT])  |
+                                 (~csr_wmask[`CSR_DMW_MAT]  & csr_dmw0_mat);
+                csr_dmw0_plv3 <= ( csr_wmask[`CSR_DMW_PLV3] & csr_wvalue[`CSR_DMW_PLV3]) |
+                                 (~csr_wmask[`CSR_DMW_PLV3] & csr_dmw0_plv3);
+                csr_dmw0_plv0 <= ( csr_wmask[`CSR_DMW_PLV0] & csr_wvalue[`CSR_DMW_PLV0]) |
+                                 (~csr_wmask[`CSR_DMW_PLV0] & csr_dmw0_plv0);
+            end
+        end
+    end
+    wire [31:0] csr_dmw0 =
+                //       31:29    28          27:25   24:6           5:4              3   2:1              0
+                {csr_dmw0_vseg, 1'd0, csr_dmw0_pseg, 19'd0, csr_dmw0_mat, csr_dmw0_plv3, 2'd0, csr_dmw0_plv0};
 
-    assign csr_rvalue = {32{csr_num == `CSR_CRMD  }} & csr_crmd
-                      | {32{csr_num == `CSR_PRMD  }} & csr_prmd
-                      | {32{csr_num == `CSR_ECFG  }} & csr_ecfg
-                      | {32{csr_num == `CSR_ESTAT }} & csr_estat
-                      | {32{csr_num == `CSR_ERA   }} & csr_era
-                      | {32{csr_num == `CSR_BADV  }} & csr_badv
-                      | {32{csr_num == `CSR_EENTRY}} & csr_eentry
-                      | {32{csr_num == `CSR_SAVE0 }} & csr_save0
-                      | {32{csr_num == `CSR_SAVE1 }} & csr_save1
-                      | {32{csr_num == `CSR_SAVE2 }} & csr_save2
-                      | {32{csr_num == `CSR_SAVE3 }} & csr_save3
-                      | {32{csr_num == `CSR_TID   }} & csr_tid
-                      | {32{csr_num == `CSR_TCFG  }} & csr_tcfg
-                      | {32{csr_num == `CSR_TVAL  }} & csr_tval
-                      | {32{csr_num == `CSR_TICLR }} & csr_ticlr;
+    reg [2:0]   csr_dmw1_vseg;
+    reg [2:0]   csr_dmw1_pseg;
+    reg [1:0]   csr_dmw1_mat;
+    reg         csr_dmw1_plv3;
+    reg         csr_dmw1_plv0;
+    always @(posedge clk) begin
+        if (~resetn) begin
+            csr_dmw1_vseg <= 3'd0;
+            csr_dmw1_pseg <= 3'd0;
+            csr_dmw1_mat  <= 2'd0;
+            csr_dmw1_plv3 <= 1'd0;
+            csr_dmw1_plv0 <= 1'd0;
+        end else begin
+            if (csr_we && csr_num == `CSR_DMW1) begin
+                csr_dmw1_vseg <= ( csr_wmask[`CSR_DMW_VSEG] & csr_wvalue[`CSR_DMW_VSEG]) |
+                                 (~csr_wmask[`CSR_DMW_VSEG] & csr_dmw1_vseg);
+                csr_dmw1_pseg <= ( csr_wmask[`CSR_DMW_PSEG] & csr_wvalue[`CSR_DMW_PSEG]) |
+                                 (~csr_wmask[`CSR_DMW_PSEG] & csr_dmw1_pseg);
+                csr_dmw1_mat  <= ( csr_wmask[`CSR_DMW_MAT]  & csr_wvalue[`CSR_DMW_MAT])  |
+                                 (~csr_wmask[`CSR_DMW_MAT]  & csr_dmw1_mat);
+                csr_dmw1_plv3 <= ( csr_wmask[`CSR_DMW_PLV3] & csr_wvalue[`CSR_DMW_PLV3]) |
+                                 (~csr_wmask[`CSR_DMW_PLV3] & csr_dmw1_plv3);
+                csr_dmw1_plv0 <= ( csr_wmask[`CSR_DMW_PLV0] & csr_wvalue[`CSR_DMW_PLV0]) |
+                                 (~csr_wmask[`CSR_DMW_PLV0] & csr_dmw1_plv0);
+            end
+        end
+    end
+    wire [31:0] csr_dmw1 =
+                //       31:29    28          27:25   24:6           5:4              3   2:1              0
+                {csr_dmw1_vseg, 1'd0, csr_dmw1_pseg, 19'd0, csr_dmw1_mat, csr_dmw1_plv3, 2'd0, csr_dmw1_plv0};
+
+
+    assign csr_rvalue = {32{csr_num == `CSR_CRMD     }} & csr_crmd
+                      | {32{csr_num == `CSR_PRMD     }} & csr_prmd
+                      | {32{csr_num == `CSR_ECFG     }} & csr_ecfg
+                      | {32{csr_num == `CSR_ESTAT    }} & csr_estat
+                      | {32{csr_num == `CSR_ERA      }} & csr_era
+                      | {32{csr_num == `CSR_BADV     }} & csr_badv
+                      | {32{csr_num == `CSR_EENTRY   }} & csr_eentry
+                      | {32{csr_num == `CSR_TLBIDX   }} & csr_tlbidx
+                      | {32{csr_num == `CSR_TLBEHI   }} & csr_tlbehi
+                      | {32{csr_num == `CSR_TLBELO0  }} & csr_tlbelo0
+                      | {32{csr_num == `CSR_TLBELO1  }} & csr_tlbelo1
+                      | {32{csr_num == `CSR_ASID     }} & csr_asid
+                      | {32{csr_num == `CSR_TLBRENTRY}} & csr_tlbren
+                      | {32{csr_num == `CSR_SAVE0    }} & csr_save0
+                      | {32{csr_num == `CSR_SAVE1    }} & csr_save1
+                      | {32{csr_num == `CSR_SAVE2    }} & csr_save2
+                      | {32{csr_num == `CSR_SAVE3    }} & csr_save3
+                      | {32{csr_num == `CSR_TID      }} & csr_tid
+                      | {32{csr_num == `CSR_TCFG     }} & csr_tcfg
+                      | {32{csr_num == `CSR_TVAL     }} & csr_tval
+                      | {32{csr_num == `CSR_TICLR    }} & csr_ticlr
+                      | {32{csr_num == `CSR_DMW0     }} & csr_dmw0
+                      | {32{csr_num == `CSR_DMW1     }} & csr_dmw1;
 
     assign ex_entry = {csr_eentry_va, 6'd0};
     assign era = csr_era;
     assign has_int = (|(csr_estat_is & csr_ecfg_lie)) & csr_crmd_ie;
+
+    // TLB helper outputs
+    assign tlbidx_index       = csr_tlbidx_index;
+    assign tlbidx_ps          = csr_tlbidx_ps;
+    assign tlbidx_ne          = csr_tlbidx_ne;
+    assign tlbehi_vppn        = csr_tlbehi_vppn;
+    assign csr_tlbidx_value   = csr_tlbidx;
+    assign csr_tlbehi_value   = csr_tlbehi;
+    assign csr_tlbelo0_value  = csr_tlbelo0;
+    assign csr_tlbelo1_value  = csr_tlbelo1;
+    assign csr_asid_value     = csr_asid;
+    assign csr_tlbren_value   = csr_tlbren;
+    assign csr_crmd_da_value  = csr_crmd_da;
+    assign csr_crmd_pg_value  = csr_crmd_pg;
+    assign csr_crmd_plv_value = csr_crmd_plv;
+    assign csr_crmd_datf_value = csr_crmd_datf;
+    assign csr_crmd_datm_value = csr_crmd_datm;
+    assign csr_dmw0_value     = csr_dmw0;
+    assign csr_dmw1_value     = csr_dmw1;
 
 endmodule // CSR

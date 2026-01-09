@@ -1,36 +1,82 @@
 `include "macros.h"
 module EXEU(
-    input  wire        clk,
-    input  wire        resetn,
+    input wire                       clk,
+    input wire                       resetn,
 
     // Global flush from WB (exception/ertn)
-    input  wire        flush,
+    input wire                       flush,
 
     // Pipeline interface with ID stage
-    output wire        exe_allowin,
-    input  wire        id_to_exe_valid,
-    input  wire [`ID2EXE_LEN - 1:0] id_to_exe_zip,
+    output wire                      exe_allowin,
+    input wire                       id_to_exe_valid,
+    input wire [`ID2EXE_LEN - 1:0]   id_to_exe_zip,
 
     // Pipeline interface with MEM stage
-    input  wire        mem_allowin,
-    output wire        exe_to_mem_valid,
+    input wire                       mem_allowin,
+    output wire                      exe_to_mem_valid,
     output wire [`EXE2MEM_LEN - 1:0] exe_to_mem_zip,
 
-    // Data SRAM-like interface
-    output wire        data_sram_req,
-    output wire        data_sram_wr,
-    output wire [ 1:0] data_sram_size,
-    output wire [31:0] data_sram_addr,
-    output wire [ 3:0] data_sram_wstrb,
-    output wire [31:0] data_sram_wdata,
-    input  wire        data_sram_addr_ok,
+    // Data Cache interface
+    output wire                      data_valid,
+    output wire                      data_op,
+    output wire [ 7:0]               data_index,
+    output wire [19:0]               data_tag,
+    output wire [ 3:0]               data_offset,
+    output wire [ 3:0]               data_wstrb,
+    output wire [31:0]               data_wdata,
+    output wire                      data_uncache,
+    output wire                      data_vaddr_bit0,  // vaddr[0] for CACOP way selection
+    output wire [ 7:0]               data_vaddr_index, // vaddr[11:4] for CACOP index selection
+    input wire                       data_addr_ok,
+    input wire                       data_data_ok,
+    input wire [31:0]                data_rdata,
+
+    // CACOP interface to I-Cache
+    output wire                      icache_cacop_valid,
+    output wire [4:0]                icache_cacop_code,
+    input wire                       icache_cacop_rdy,
+    input wire                       icache_cacop_done,
+    output wire [31:0]               icache_cacop_paddr,  // TLB translated PA for Query Index
+
+    // CACOP interface to D-Cache
+    output wire                      dcache_cacop_valid,
+    output wire [4:0]                dcache_cacop_code,
+    input wire                       dcache_cacop_rdy,
+    input wire                       dcache_cacop_done,
+    output wire [31:0]               dcache_cacop_paddr,   // TLB translated PA for Query Index
 
     // Data forwarding to ID stage
-    output wire [39:0] exe_rf_zip,     // {exe_res_from_mem, exe_rf_we, exe_rf_waddr, exe_alu_result}
+    output wire [39:0]               exe_rf_zip, // {exe_res_from_mem, exe_rf_we, exe_rf_waddr, exe_alu_result}
 
     // Exception signal forwarding from MEM and WB stage
-    input wire         mem_ex,
-    input wire         wb_ex
+    input wire                       mem_ex,
+    input wire                       wb_ex,
+
+    // CSR helper signals
+    input wire [18:0]                csr_tlbehi_vppn,
+    input wire [9:0]                 csr_asid_asid,
+    input wire                       csr_crmd_da_value,
+    input wire                       csr_crmd_pg_value,
+    input wire [1:0]                 csr_crmd_plv_value,
+    input wire [1:0]                 csr_crmd_datm_value,
+    input wire [31:0]                csr_dmw0_value,
+    input wire [31:0]                csr_dmw1_value,
+
+    // TLB related (Port 1)
+    output wire [18:0]               s1_vppn,
+    output wire                      s1_va_bit12,
+    output wire [9:0]                s1_asid,
+    input wire                       s1_found,
+    input wire [3:0]                 s1_index,
+    input wire [19:0]                s1_ppn,
+    input wire [5:0]                 s1_ps,
+    input wire [1:0]                 s1_plv,
+    input wire [1:0]                 s1_mat,
+    input wire                       s1_d,
+    input wire                       s1_v,
+    // TLB invalid
+    output wire                      tlb_invtlb_valid,
+    output wire [4:0]                tlb_invtlb_op
 );
 
     // Pipeline control
@@ -54,6 +100,14 @@ module EXEU(
     reg  [13:0] exe_csr_num;
     reg  [31:0] exe_csr_wmask;
     reg  [31:0] exe_csr_wvalue;
+    // TLB pipeline fields
+    reg  [2:0]  exe_tlb_op;
+    reg  [4:0]  exe_invtlb_op;
+    // CACOP pipeline fields
+    reg         exe_cacop_valid;
+    reg  [4:0]  exe_cacop_code;
+    reg         exe_cacop_is_icache;
+    reg         exe_cacop_is_dcache;
     // Exception pipeline fields
     reg         exe_ex_valid;
     reg  [5:0]  exe_ecode;
@@ -112,8 +166,16 @@ module EXEU(
     wire   start_multicycle;
     assign start_multicycle = is_multicycle_op & start_exe & exe_multicycle_ok;  // Special time stamp
     
-    // EXE ready_go: no pending multicycle ops and memory request done
-    assign exe_ready_go = ~start_multicycle & ~multicycle_executing & (~exe_mem_req | exe_mem_req & data_sram_addr_ok);
+    // EXE ready_go: no pending multicycle ops and memory request done and CACOP complete
+    wire exe_cacop_icache = exe_cacop_valid & exe_cacop_is_icache;
+    wire exe_cacop_dcache = exe_cacop_valid & exe_cacop_is_dcache;
+    wire exe_cacop_has_target = exe_cacop_icache | exe_cacop_dcache;
+    wire exe_cacop_done = (~exe_cacop_valid) |
+                          (~exe_cacop_has_target) |
+                          (exe_cacop_icache & icache_cacop_done) |
+                          (exe_cacop_dcache & dcache_cacop_done);
+    assign exe_ready_go = ~start_multicycle & ~multicycle_executing & (~exe_mem_req | exe_mem_req & data_addr_ok) &
+                          exe_cacop_done;
     assign exe_allowin = ~exe_valid | (exe_ready_go & mem_allowin);
     assign exe_to_mem_valid = exe_valid & exe_ready_go;
 
@@ -136,26 +198,61 @@ module EXEU(
              exe_rkd_value, exe_pc,
              exe_rdcntvl, exe_rdcntvh,
              exe_csr_read, exe_csr_we, exe_csr_num, exe_csr_wmask, exe_csr_wvalue,
-             exe_ex_valid, exe_ecode, exe_esubcode, exe_is_ertn} <= id_to_exe_zip;
+             exe_cacop_valid, exe_cacop_code, exe_cacop_is_icache, exe_cacop_is_dcache,
+             exe_ex_valid, exe_ecode, exe_esubcode, exe_is_ertn,
+             exe_tlb_op, exe_invtlb_op} <= id_to_exe_zip;
             start_exe <= 1'b1;
         end else
             start_exe <= 1'b0;
     end
 
+    // Address Translation
+    wire is_dmw0 =
+         (exe_alu_result[31:29] == csr_dmw0_value[31:29]) &&
+         ((csr_crmd_plv_value == 2'd0) && (csr_dmw0_value[0]) ||
+          (csr_crmd_plv_value == 2'd3) && (csr_dmw0_value[3]));
+    wire is_dmw1 =
+         (exe_alu_result[31:29] == csr_dmw1_value[31:29]) &&
+         ((csr_crmd_plv_value == 2'd0) && (csr_dmw1_value[0]) ||
+          (csr_crmd_plv_value == 2'd3) && (csr_dmw1_value[3]));
+    wire [31:0] paddr =
+                csr_crmd_pg_value ?
+                ( is_dmw0 ? {csr_dmw0_value[27:25], exe_alu_result[28:0]} :
+                  is_dmw1 ? {csr_dmw1_value[27:25], exe_alu_result[28:0]} :
+                  ( (s1_ps == 12) ?
+                    {s1_ppn[19:0], exe_alu_result[11:0]} :
+                    {s1_ppn[19:9], exe_alu_result[20:0]} )
+                 ) : exe_alu_result;
 
     // Exception generation
     // Address alignment check for memory operations
     wire is_mem_op = (exe_mem_op != 4'd0);
+    wire is_cacop_query = exe_cacop_valid & (exe_cacop_code[4:3] == 2'b10);
     wire is_half_op = (exe_mem_op == 4'd1) | (exe_mem_op == 4'd5) | (exe_mem_op == 4'd9); // ld.h, st.h, ld.hu
     wire is_word_op = (exe_mem_op == 4'd2) | (exe_mem_op == 4'd6); // ld.w, st.w
     
-    wire addr_align_error = is_mem_op & (
-                           (is_half_op & exe_alu_result[0]) |        // Half-word must be 2-byte aligned
-                           (is_word_op & (|exe_alu_result[1:0]))     // Word must be 4-byte aligned
-                           );
+    wire addr_align_error    = is_mem_op & ((is_half_op & paddr[0]) |        // Half-word must be 2-byte aligned
+                                            (is_word_op & (|paddr[1:0]))     // Word must be 4-byte aligned
+                                            );
+    wire tlb_gen_error       = (is_mem_op | is_cacop_query) & csr_crmd_pg_value & !is_dmw0 & !is_dmw1;
+    wire tlb_refill_error    = tlb_gen_error & !s1_found;
+    wire load_invalid_error  = tlb_gen_error & !is_store & s1_found & !s1_v;
+    wire store_invalid_error = tlb_gen_error &  is_store & s1_found & !s1_v;
+    wire tlb_plv_error       = tlb_gen_error & s1_found & s1_v & (csr_crmd_plv_value > s1_plv);
+    wire tlb_modify_error    = tlb_gen_error & s1_found & s1_v & is_store & !s1_d;
     
-    wire        exe_gen_ex_valid = addr_align_error;
-    wire [5:0]  exe_gen_ecode    = addr_align_error ? `ECODE_ALE : 6'd0;
+    wire        exe_gen_ex_valid =
+                addr_align_error   | tlb_refill_error    |
+                load_invalid_error | store_invalid_error |
+                tlb_plv_error      | tlb_modify_error;
+    wire [5:0]  exe_gen_ecode    =
+                addr_align_error    ? `ECODE_ALE  :
+                tlb_refill_error    ? `ECODE_TLBR :
+                load_invalid_error  ? `ECODE_PIL  :
+                store_invalid_error ? `ECODE_PIS  :
+                tlb_plv_error       ? `ECODE_PPI  :
+                tlb_modify_error    ? `ECODE_PME  :
+                6'd0;
     wire [8:0]  exe_gen_esubcode = `ESUBCODE_NONE;
 
     wire        exe_to_mem_ex_valid = exe_gen_ex_valid ? 1'b1 : exe_ex_valid;
@@ -235,11 +332,28 @@ module EXEU(
                           exe_rdcntvh    ? stable_clk_counter[63:32] : // RDCNTVH: stable counter high 32 bits
                           exe_alu_result;                              // Regular ALU result
 
-    // Data SRAM-like interface
-    wire addr0 = (exe_alu_result[1:0] == 2'd0);
-    wire addr1 = (exe_alu_result[1:0] == 2'd1);
-    wire addr2 = (exe_alu_result[1:0] == 2'd2);
-    wire addr3 = (exe_alu_result[1:0] == 2'd3);
+    // TLB search / INVTLB interface (port 1)
+    wire tlb_va_valid = is_mem_op | is_cacop_query;
+    assign s1_vppn     = (exe_tlb_op == `TLB_OP_SRCH) ? csr_tlbehi_vppn :
+                         (exe_tlb_op == `TLB_OP_INV ) ? exe_rkd_value[31:13] :
+                         tlb_va_valid                 ? exe_alu_result[31:13] :
+                         19'd0;
+    assign s1_va_bit12 = (exe_tlb_op == `TLB_OP_SRCH) ? 1'b0 :
+                         (exe_tlb_op == `TLB_OP_INV ) ? exe_rkd_value[12] :
+                         tlb_va_valid                 ? exe_alu_result[12] :
+                         1'b0;
+    assign s1_asid     = (exe_tlb_op == `TLB_OP_SRCH) ? csr_asid_asid :
+                         (exe_tlb_op == `TLB_OP_INV ) ? exe_alu_src1[9:0] :
+                         tlb_va_valid                 ? csr_asid_asid :
+                         10'd0;
+    assign tlb_invtlb_op  = exe_invtlb_op;
+    assign tlb_invtlb_valid = exe_to_mem_valid & (exe_tlb_op == `TLB_OP_INV);
+
+    // DCache interface
+    wire addr0 = (paddr[1:0] == 2'd0);
+    wire addr1 = (paddr[1:0] == 2'd1);
+    wire addr2 = (paddr[1:0] == 2'd2);
+    wire addr3 = (paddr[1:0] == 2'd3);
 
     wire is_byte_op = (exe_mem_op == 4'd0) | (exe_mem_op == 4'd4) | (exe_mem_op == 4'd8);  // ld.b, st.b, ld.bu
     wire is_store = exe_mem_op[2];  // st.b, st.h, st.w
@@ -247,50 +361,77 @@ module EXEU(
     // Only send request when MEM stage allows in (simplified design)
     wire   exe_mem_req;
     assign exe_mem_req = (exe_res_from_mem | is_store) & exe_multicycle_ok;
-    assign data_sram_req = exe_mem_req & exe_valid & mem_allowin;
-    assign data_sram_wr = is_store & exe_multicycle_ok;
-    assign data_sram_size = is_byte_op ? 2'd0 :   // 1 byte
-                            is_half_op ? 2'd1 :   // 2 bytes
-                            is_word_op ? 2'd2 :   // 4 bytes
-                            2'd0;
+
+    wire [1:0] data_mat = 
+               !csr_crmd_pg_value ? csr_crmd_datm_value : // DA mode: cacheable by default
+               ( is_dmw0 ? csr_dmw0_value[5:4] :     // DMW0 MAT
+                 is_dmw1 ? csr_dmw1_value[5:4] :     // DMW1 MAT
+                 s1_mat                              // TLB MAT
+                 );
     
-    assign data_sram_wstrb =   // st.b
-                               (exe_mem_op == 4'd4) ?
-                               ( addr0 ? 4'b0001 :
-                                 addr1 ? 4'b0010 :
-                                 addr2 ? 4'b0100 :
-                                 addr3 ? 4'b1000 :
-                                 4'b0000) :
-                               // st.h
-                               (exe_mem_op == 4'd5) ?
-                               ( (addr0 | addr1) ? 4'b0011 :
-                                 (addr2 | addr3) ? 4'b1100 :
-                                 4'b0000 ) :
-                               // st.w
-                               (exe_mem_op == 4'd6) ?
-                               ( 4'b1111 ) : 4'b0000;
-    assign data_sram_addr   = exe_alu_result;
-    assign data_sram_wdata  = // st.b
-                              (exe_mem_op == 4'd4) ?
-                              ( addr0 ? {24'd0, exe_rkd_value[7:0]       } :
-                                addr1 ? {16'd0, exe_rkd_value[7:0],  8'd0} :
-                                addr2 ? { 8'd0, exe_rkd_value[7:0], 16'd0} :
-                                addr3 ? {       exe_rkd_value[7:0], 24'd0} :
-                                32'd0 ) :
-                              // st.h
-                              (exe_mem_op == 4'd5) ?
-                              ( (addr0 | addr1) ? {16'd0, exe_rkd_value[15:0]} :
-                                (addr2 | addr3) ? {exe_rkd_value[15:0], 16'd0} :
-                                32'd0 ) :
-                              // st.w
-                              (exe_mem_op == 4'd6) ?
-                              ( exe_rkd_value ) :
-                              // default
-                              32'd0;
+    assign data_valid = exe_mem_req & exe_valid & mem_allowin;
+    assign data_op    = is_store;
+    assign data_wstrb =   // st.b
+                          (exe_mem_op == 4'd4) ?
+                          ( addr0 ? 4'b0001 :
+                            addr1 ? 4'b0010 :
+                            addr2 ? 4'b0100 :
+                            addr3 ? 4'b1000 :
+                            4'b0000) :
+                          // st.h
+                          (exe_mem_op == 4'd5) ?
+                          ( (addr0 | addr1) ? 4'b0011 :
+                            (addr2 | addr3) ? 4'b1100 :
+                            4'b0000 ) :
+                          // st.w
+                          (exe_mem_op == 4'd6) ?
+                          ( 4'b1111 ) : 4'b0000;
+    assign data_index  = paddr[11: 4];
+    assign data_tag    = paddr[31:12];
+    assign data_offset = paddr[ 3:0];
+    assign data_vaddr_bit0 = exe_alu_result[0];  // VA[0] for CACOP way selection (both ICache and DCache)
+    assign data_vaddr_index = exe_alu_result[11:4];
+    assign data_wdata  = // st.b
+                         (exe_mem_op == 4'd4) ?
+                         ( addr0 ? {24'd0, exe_rkd_value[7:0]       } :
+                           addr1 ? {16'd0, exe_rkd_value[7:0],  8'd0} :
+                           addr2 ? { 8'd0, exe_rkd_value[7:0], 16'd0} :
+                           addr3 ? {       exe_rkd_value[7:0], 24'd0} :
+                           32'd0 ) :
+                         // st.h
+                         (exe_mem_op == 4'd5) ?
+                         ( (addr0 | addr1) ? {16'd0, exe_rkd_value[15:0]} :
+                           (addr2 | addr3) ? {exe_rkd_value[15:0], 16'd0} :
+                           32'd0 ) :
+                         // st.w
+                         (exe_mem_op == 4'd6) ?
+                         ( exe_rkd_value ) :
+                         // default
+                         32'd0;
+    assign data_uncache = (data_mat == 2'b00);  // SUC (MAT=0): uncached
+
+    // CACOP interface to caches
+    assign icache_cacop_valid = exe_cacop_valid & exe_cacop_is_icache & exe_valid;
+    assign icache_cacop_code  = exe_cacop_code;
+    assign icache_cacop_paddr = paddr;  // Use translated PA for Query Index
+    assign dcache_cacop_valid = exe_cacop_valid & exe_cacop_is_dcache & exe_valid;
+    assign dcache_cacop_code  = exe_cacop_code;
+    assign dcache_cacop_paddr = paddr;  // Use translated PA for Query Index
+
+    // CSR value adjustment for TLB search
+    // TLBSRCH only updates NE (bit 31) and Index (bit 3:0), PS field is preserved
+    // Use combinational signals directly from TLB module, not pipeline registers
+    wire [31:0] tlbsrch_wvalue = {~s1_found, 7'd0, 20'd0, s1_index};
+    wire [31:0] tlbsrch_wmask  = 32'h8000_000f;  // Only update bit 31 (NE) and bit 3:0 (Index)
+    wire [13:0] exe_csr_num_final    = (exe_tlb_op == `TLB_OP_SRCH) ? `CSR_TLBIDX : exe_csr_num;
+    wire        exe_csr_we_final     = (exe_tlb_op == `TLB_OP_SRCH) ? 1'b1        : exe_csr_we;
+    wire        exe_csr_read_final   = (exe_tlb_op == `TLB_OP_SRCH) ? 1'b0        : exe_csr_read;
+    wire [31:0] exe_csr_wmask_final  = (exe_tlb_op == `TLB_OP_SRCH) ? tlbsrch_wmask : exe_csr_wmask;
+    wire [31:0] exe_csr_wvalue_final = (exe_tlb_op == `TLB_OP_SRCH) ? tlbsrch_wvalue : exe_csr_wvalue;
 
     // Forward data to IDU
     assign exe_rf_zip = {
-            exe_valid & exe_csr_read,
+            exe_valid & (exe_csr_read_final | exe_csr_we_final),
             exe_valid & exe_res_from_mem,
             exe_valid & exe_rf_we,
             exe_rf_waddr,
@@ -307,18 +448,21 @@ module EXEU(
             exe_mem_op,
             exe_pc,
 
-            exe_csr_read,
-            exe_csr_we,
-            exe_csr_num,
-            exe_csr_wmask,
-            exe_csr_wvalue,
-            
-            exe_alu_result,  // vaddr for BADV register
+            exe_csr_read_final,
+            exe_csr_we_final,
+            exe_csr_num_final,
+            exe_csr_wmask_final,
+            exe_csr_wvalue_final,
+
+            exe_ex_valid ? exe_pc : exe_alu_result,  // vaddr for BADV register
 
             exe_to_mem_ex_valid,
             exe_to_mem_ecode,
             exe_to_mem_esubcode,
-            exe_to_mem_is_ertn
+            exe_to_mem_is_ertn,
+
+            exe_tlb_op,
+            exe_invtlb_op
     };
 
 endmodule
