@@ -1024,7 +1024,81 @@ assign wvalid  = (state == S_AW) && !w_done;
 
 \subsection{CACOP指令支持（exp23）}
 
-exp23的任务是在CPU中增加CACOP指令的支持。
+exp23的任务是在CPU中增加CACOP（Cache Operation）指令的支持。CACOP指令用于执行Cache的初始化、无效化和维护操作，是操作系统管理存储一致性的重要手段。该指令的实现涉及流水线译码、地址转换以及Cache模块内部状态机的深度改造。
+
+\subsubsection{译码与执行阶段的修改}
+
+在IDU模块中，我们需要识别CACOP指令并生成相应的控制信号。CACOP被编码为一种特殊的ALU操作，它虽然涉及访存地址的生成，但并不回写通用寄存器（GR）。因此，我们将inst_cacop加入到alu_op的生成逻辑中，同时在gr_we（通用寄存器写使能）逻辑中明确排除CACOP指令，防止破坏寄存器状态。
+
+\begin{lstlisting}[language=Verilog]
+// IDU.v: Decode logic update
+assign alu_op[0] = inst_add_w | ... | inst_cacop | ...;
+assign gr_we = ~(... | inst_cacop) & id_valid & ~id_ex_valid;
+assign need_r1 = (~src1_is_pc & (|alu_op)) | inst_invtlb | inst_cacop;
+\end{lstlisting}
+
+在EXEU模块，CACOP的处理逻辑较为复杂，主要体现在地址处理和流水线阻塞上。
+
+\textbf{1. 地址生成与TLB交互}： CACOP指令的操作对象取决于其功能码（Code）。根据LoongArch规范和实验要求： \begin{itemize} \item \textbf{Code 0 (Store Tag) / Code 1 (Index Invalidate)}：采用“直接索引（Direct Indexing）”方式。此时不需要进行虚实地址转换，直接使用虚拟地址的索引域（Index）和Way选择位。我们在EXEU中提取虚拟地址的[11:4]作为Index，提取VA[0]作为Way选择信号（data_vaddr_bit0）。 \item \textbf{Code 2 (Query Index)}：采用“查询索引（Query Index）”方式。此时需要根据物理地址查找Cache，因此必须经过TLB进行地址翻译。我们修改了tlb_gen_error和s1_vppn等逻辑，确保CACOP查询操作能正确触发TLB查找或异常。 \end{itemize}
+
+\textbf{2. 握手与阻塞}： CACOP指令必须确保Cache操作完成后流水线才能继续流动。我们在exe_ready_go信号中增加了对cacop_done的等待逻辑。
+
+\begin{lstlisting}[language=Verilog]
+// EXEU.v: Handshake logic
+wire exe_cacop_done = (~exe_cacop_valid) | (~exe_cacop_has_target) | (exe_cacop_icache & icache_cacop_done) | (exe_cacop_dcache & dcache_cacop_done);
+assign exe_ready_go = ... & exe_cacop_done;
+\end{lstlisting}
+
+\subsubsection{Cache模块的CACOP扩展}
+
+Cache模块的修改是本次任务的核心。我们需要在不破坏原有读写逻辑的前提下，增加对Cache维护操作的支持。新增的接口包括cacop_code、cacop_vaddr_index和cacop_vaddr_bit0等。
+
+\textbf{1. 请求锁存与操作类型判断}： Cache内部新增了CACOP请求缓冲区。当接收到有效的CACOP请求时，根据Code判断操作类型：如果是Query Index，则使用经TLB转换后的物理地址作为Tag；如果是Direct Indexing，则直接使用输入的虚拟Index和Way选择位。
+
+\begin{lstlisting}[language=Verilog]
+// Cache.v: CACOP Request Latch
+if (cacop_accept) begin
+    cacop_req_valid <= 1'b1;
+    if (cacop_code[4:3] == 2'b10) begin // Query Index
+        cacop_req_index <= cache_is_icache ? cacop_vaddr_index : cacop_paddr[11:4];
+        cacop_req_tag <= cacop_paddr[31:12];
+        cacop_req_is_query <= 1'b1;
+    end else begin // Store Tag / Index Invalidate
+        cacop_req_index <= cacop_vaddr_index;
+        cacop_req_way <= cacop_vaddr_bit0; // VA[0] selects way cacop_req_is_query <= 1'b0;
+    end
+end
+\end{lstlisting}
+
+\textbf{2. Dirty行的回写处理}： 对于“Index Invalidate”操作，如果目标Cache行是脏的（Dirty），直接无效化会导致数据丢失。因此，我们实现了自动回写机制。在STATE_LOOKUP状态，如果检测到CACOP操作命中且目标行Dirty，状态机会跳转到STATE_MISS，复用Cache缺失时的替换逻辑将脏数据写回内存。
+
+\begin{lstlisting}[language=Verilog]
+// Cache.v: Detect need for writeback
+wire cacop_need_wb_lookup = cacop_lookup && !cache_is_icache && (cacop_req_op_idx || cacop_req_op_qry) && cacop_lookup_hit && ((cacop_lookup_way0 && way0_v && way0_d) || (cacop_lookup_way1 && way1_v && way1_d));
+
+// Main FSM update 
+STATE_LOOKUP: begin 
+    if (cacop_req_valid) begin 
+        if (cacop_need_wb_lookup) begin
+            main_next_state = STATE_MISS; // Trigger Writeback
+        end else begin
+            main_next_state = STATE_IDLE; // Just Invalidate end 
+        end // ... 
+    end
+\end{lstlisting}
+
+\textbf{3. RAM写使能控制}： 最后，我们需要根据CACOP操作更新Tag RAM和Dirty表。对于Store Tag和Index Invalidate操作，目标行的Valid位会被置为0。通过生成的cacop_clear_wayX信号，我们强制拉高Tag RAM的写使能，写入全0数据。
+
+\begin{lstlisting}[language=Verilog]
+// Cache.v: Tag RAM control
+assign tagv_wdata = (cacop_clear_way0 || cacop_clear_way1) ? {20'b0, 1'b0} : {req_tag, 1'b1}; assign tagv_addr = cacop_use_req ? cacop_req_index : ...;
+\end{lstlisting}
+
+\subsubsection{Top层集成与仲裁优化}
+
+在mycpu_top.v中，我们将EXEU产生的CACOP信号分别连接到ICache和DCache。为了应对增加的维护指令流量，我们在bridge.v中优化了AXI总线的仲裁逻辑，将原本的固定优先级改为轮询（Round-Robin）机制，防止在高频Cache操作下发生数据通道饥饿。
+
+通过上述设计，CPU能够正确执行CACOP指令，既支持基于虚址的快速索引无效化，也支持基于实址的查询操作，并能自动处理脏数据的回写，保证了存储系统的一致性。
 
 \section{实验结果}
 
